@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""stdio MCP server: one named tool per bir-headless allow-listed invoke.
+
+Wraps the installed `gpui-agent` CLI. Does not speak the HMAC protocol itself
+and does not start the daemon. Filing and submit verbs are not tools.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+DEFAULT_ADDR = "127.0.0.1:17421"
+EXPECTED_APP = "bir-desktop"
+SERVER_NAME = "bir-mcp"
+SERVER_VERSION = "0.1.0"
+PROTOCOL_FALLBACK = "2024-11-05"
+KNOWN_PROTOCOLS = {
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+}
+
+# Daemon verbs confirmed in bir-desktop AgentHost::invoke. Not aliases we
+# invented. filing.submit / queue / file are intentionally absent.
+def _dues_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "tin": {"type": "string"},
+            "q": {"type": "string"},
+            "filter": {"type": "string", "enum": ["upcoming", "overdue", "all"]},
+            "scope": {"type": "string", "enum": ["profile", "global", "upcoming", "overdue", "all"]},
+            "limit": {"type": "integer"},
+        },
+        "additionalProperties": False,
+    }
+
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "profile_list",
+        "invoke": "profile.list",
+        "description": (
+            "List every eBIRforms taxpayer profile on bir-headless. "
+            "Daemon verb profile.list (not profile_list, not profiles). "
+            "Returns tin, name, last4, selected, archived. "
+            "This is the tool to call when asked to list tax profiles. "
+            "Connects to GPUI_AGENT_ADDR (default 127.0.0.1:17421) and "
+            "refuses the call unless hello.app is bir-desktop."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "profile_search",
+        "invoke": "profile.search",
+        "description": (
+            "Search profiles by TIN substring or name (daemon verb profile.search). "
+            "Does not create a profile. Empty q lists all."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "TIN substring or name. Case-insensitive."}
+            },
+            "required": ["q"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "profile_set",
+        "invoke": "profile.set",
+        "description": (
+            "Select one profile (daemon verb profile.set). Pass tin or q. "
+            "0 hits is not_found and does not create. Many hits is ambiguous."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tin": {"type": "string", "description": "14-digit TIN."},
+                "q": {"type": "string", "description": "TIN substring or name, if tin is omitted."},
+                "view": {
+                    "type": "string",
+                    "enum": ["dashboard", "profile-manager"],
+                    "description": "Where to land after a unique hit. Default dashboard.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "profile_html",
+        "invoke": "profile.html",
+        "description": (
+            "Read-only identity card HTML for a profile (daemon verb profile.html). "
+            "Omit tin and q to use the selected profile. Omits PIN, TOTP, and secrets."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tin": {"type": "string"},
+                "q": {"type": "string"},
+                "year": {"type": "integer", "description": "Optional year for Forms Set codes on the card."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "profile_forms_set_get",
+        "invoke": "profile.forms_set.get",
+        "description": (
+            "Read per-year Forms Set codes (daemon verb profile.forms_set.get). "
+            "Does not write."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer"},
+                "tin": {"type": "string"},
+                "q": {"type": "string"},
+            },
+            "required": ["year"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "profile_forms_set",
+        "invoke": "profile.forms_set",
+        "description": (
+            "Replace one year's Forms Set (daemon verb profile.forms_set). "
+            "confirm must be the JSON boolean true; the string \"true\" is refused by the host. "
+            "Unknown form codes are refused. This does not file a return."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer"},
+                "codes": {
+                    "description": "Comma-separated codes (1601C,2551Q) or an array of codes.",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be JSON true. Forwarded to the host.",
+                },
+                "reason": {"type": "string"},
+                "tin": {"type": "string"},
+                "q": {"type": "string"},
+            },
+            "required": ["year", "codes", "confirm"],
+            "additionalProperties": False,
+        },
+        "require_confirm": True,
+        "forward_confirm": True,
+    },
+    {
+        "name": "profile_create",
+        "invoke": "profile.create",
+        "description": (
+            "Open the Create Profile editor (daemon verb profile.create). "
+            "Does not save and does not create a taxpayer row."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "profile_save",
+        "invoke": "profile.save",
+        "description": (
+            "Validate and save the open profile editor (daemon verb profile.save). "
+            "Pass confirm true only after a person agreed to write the live taxpayer database. "
+            "confirm is enforced here and is not sent to the host."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true. Not forwarded; the host has no confirm arg on profile.save.",
+                }
+            },
+            "required": ["confirm"],
+            "additionalProperties": False,
+        },
+        "require_confirm": True,
+        "forward_confirm": False,
+    },
+    {
+        "name": "dues_html",
+        "invoke": "dues.html",
+        "description": (
+            "Write the dues demo HTML bundle (daemon verb dues.html). "
+            "Same data as the tax calendar. Does not file."
+        ),
+        "inputSchema": _dues_schema(),
+    },
+    {
+        "name": "calendar_html",
+        "invoke": "calendar.html",
+        "description": (
+            "Calendar HTML (daemon verb calendar.html, a host alias of dues.html). "
+            "Use this when the task says calendar. Does not file."
+        ),
+        "inputSchema": _dues_schema(),
+    },
+    {
+        "name": "nav_go",
+        "invoke": "nav.go",
+        "description": (
+            "Navigate to an ActiveView slug (daemon verb nav.go). "
+            "Examples: global-dashboard, dashboard, profile-manager, settings, form-1601c."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"page": {"type": "string"}},
+            "required": ["page"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "filing_start",
+        "invoke": "filing.start",
+        "description": (
+            "Open a form for the selected (or given) profile (daemon verb filing.start). "
+            "Does not validate, queue, or file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "description": "Form code, for example 1601C or 2551Q."},
+                "year": {"type": "integer"},
+                "period": {
+                    "type": "integer",
+                    "description": "1601-C month (1-12) or 2551Q quarter (1-4).",
+                },
+                "tin": {"type": "string"},
+                "q": {"type": "string"},
+            },
+            "required": ["code", "year", "period"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "form_fill",
+        "invoke": "form.fill",
+        "description": (
+            "Set fillable keys on the open 1601-C or 2551Q (daemon verb form.fill). "
+            "1601-C: tax_14, tax_25, sheets, any_taxes_withheld, category_of_agent. "
+            "2551Q: creditable_tax_withheld, other_tax_credit, taxable_amount. "
+            "Unknown keys are refused. Does not queue or file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "object",
+                    "description": "Optional object of fillable keys. Top-level keys are also sent.",
+                    "additionalProperties": True,
+                }
+            },
+            "additionalProperties": True,
+        },
+    },
+    {
+        "name": "filing_validate",
+        "invoke": "filing.validate",
+        "description": (
+            "Run FormValidator on the open 1601-C or 2551Q (daemon verb filing.validate). "
+            "Does not file."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "form_save_draft",
+        "invoke": "form.save_draft",
+        "description": (
+            "Persist the open 1601-C or 2551Q as a draft (daemon verb form.save_draft). "
+            "Does not queue or file."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "form_pdf",
+        "invoke": "form.pdf",
+        "description": (
+            "Build frozen HTML for the open return (daemon verb form.pdf). "
+            "Returns an absolute path and kind frozen-html. Does not validate or file."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+]
+
+
+def tool_by_name(name: str) -> dict[str, Any] | None:
+    for tool in TOOLS:
+        if tool["name"] == name:
+            return tool
+    return None
+
+
+def public_tools() -> list[dict[str, Any]]:
+    out = []
+    for tool in TOOLS:
+        out.append(
+            {
+                "name": tool["name"],
+                "description": tool["description"],
+                "inputSchema": tool["inputSchema"],
+            }
+        )
+    return out
+
+
+def encode_arg(key: str, value: Any) -> str:
+    """One gpui-agent --arg token. JSON so TINs stay strings and bools stay bools."""
+    if not key or "=" in key or not key.replace(".", "").replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"refusing argument name {key!r}")
+    return f"{key}={json.dumps(value, separators=(',', ':'), ensure_ascii=False)}"
+
+
+def addr_from_env() -> str:
+    raw = os.environ.get("GPUI_AGENT_ADDR", "").strip()
+    return raw or DEFAULT_ADDR
+
+
+def token_from_env() -> str:
+    return os.environ.get("GPUI_AGENT_TOKEN", "").strip()
+
+
+def gpui_bin() -> str:
+    override = os.environ.get("GPUI_AGENT_BIN", "").strip()
+    if override:
+        return override
+    found = shutil.which("gpui-agent")
+    if not found:
+        raise RuntimeError(
+            "gpui-agent is not on PATH. Install the v2 CLI; this server does not "
+            "reimplement the handshake."
+        )
+    return found
+
+
+def redact(text: str, token: str) -> str:
+    if token and token in text:
+        return text.replace(token, "[redacted]")
+    return text
+
+
+def run_gpui(verb_and_args: list[str], timeout: float = 60.0) -> dict[str, Any]:
+    token = token_from_env()
+    if not token:
+        raise RuntimeError(
+            "GPUI_AGENT_TOKEN is not set. This plugin does not embed a token. "
+            "Export the bir-headless token (local smoke often uses dev-secret) "
+            "in the environment that launches the MCP server."
+        )
+    addr = addr_from_env()
+    cmd = [gpui_bin(), "--addr", addr, "--token", token, *verb_and_args]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"gpui-agent timed out after {timeout:.0f}s talking to {addr}") from exc
+    stdout = (proc.stdout or "").strip()
+    stderr = redact((proc.stderr or "").strip(), token)
+    if proc.returncode != 0 and not stdout:
+        detail = stderr or f"exit {proc.returncode}"
+        raise RuntimeError(f"gpui-agent failed for {addr}: {detail}")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        detail = redact(stdout[:500], token) or stderr or "empty stdout"
+        raise RuntimeError(f"gpui-agent did not return JSON ({addr}): {detail}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"gpui-agent returned a non-object from {addr}")
+    if proc.returncode != 0 and not payload.get("ok", False):
+        err = payload.get("error") or stderr or f"exit {proc.returncode}"
+        payload["ok"] = False
+        payload["error"] = err
+    return payload
+
+
+def assert_bir_desktop(hello_payload: dict[str, Any]) -> None:
+    hello = hello_payload.get("hello")
+    if not isinstance(hello, dict):
+        raise RuntimeError(
+            f"no hello object from {addr_from_env()}. "
+            "Start bir-headless there; do not use NativeChat's port."
+        )
+    app = hello.get("app")
+    platform = hello.get("platform")
+    if app != EXPECTED_APP:
+        raise RuntimeError(
+            f"connected to app {app!r} platform {platform!r} at {addr_from_env()}, "
+            f"expected hello.app {EXPECTED_APP!r} (bir-headless). "
+            "Refusing to invoke. A generic gpui-agent session often attaches to "
+            "NativeChat instead. Point GPUI_AGENT_ADDR at bir-headless "
+            f"(default {DEFAULT_ADDR})."
+        )
+
+
+def invoke(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    hello = run_gpui(["hello"])
+    if not hello.get("ok", False):
+        err = hello.get("error") or "hello failed"
+        raise RuntimeError(
+            f"hello failed at {addr_from_env()}: {err}. "
+            "bir-headless must be running. A release binary also needs "
+            "GPUI_AGENT_ALLOW_RELEASE=1 (and GPUI_AGENT=1) or it will not start."
+        )
+    assert_bir_desktop(hello)
+    cli_args = [encode_arg(key, value) for key, value in args.items()]
+    cmd = ["invoke", name, *sum((["--arg", item] for item in cli_args), [])]
+    result = run_gpui(cmd)
+    return result
+
+
+def prepare_args(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        raise RuntimeError("arguments must be an object")
+    args = dict(arguments)
+    if tool.get("require_confirm") and args.get("confirm") is not True:
+        raise RuntimeError(
+            f"{tool['name']} requires confirm to be the JSON boolean true "
+            "(not the string \"true\"). Refusing before calling bir-headless."
+        )
+    if tool.get("require_confirm") and not tool.get("forward_confirm"):
+        args.pop("confirm", None)
+    return args
+
+
+def call_tool(name: str, arguments: Any) -> dict[str, Any]:
+    tool = tool_by_name(name)
+    if tool is None:
+        return error_result(
+            f"unknown tool {name!r}. To list tax profiles call profile_list "
+            "(daemon verb profile.list). Do not invent invoke names."
+        )
+    try:
+        args = prepare_args(tool, arguments or {})
+        payload = invoke(tool["invoke"], args)
+    except Exception as exc:  # noqa: BLE001 — surface as a tool error, not a crash
+        return error_result(str(exc))
+    if not payload.get("ok", False):
+        err = payload.get("error") or "invoke failed"
+        return error_result(f"{tool['invoke']} failed: {err}")
+    body = payload.get("result")
+    text = json.dumps(body if body is not None else payload, indent=2, ensure_ascii=False)
+    return {"content": [{"type": "text", "text": text}], "isError": False}
+
+
+def error_result(message: str) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": message}], "isError": True}
+
+
+def handle(message: dict[str, Any]) -> dict[str, Any] | None:
+    method = message.get("method")
+    msg_id = message.get("id")
+    params = message.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+
+    if method and method.startswith("notifications/"):
+        return None
+    if msg_id is None and method:
+        return None
+
+    if method == "initialize":
+        client_proto = str(params.get("protocolVersion") or "")
+        proto = client_proto if client_proto in KNOWN_PROTOCOLS else PROTOCOL_FALLBACK
+        return result(
+            msg_id,
+            {
+                "protocolVersion": proto,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": (
+                    "List tax profiles with the profile_list tool. "
+                    "It invokes profile.list on bir-headless at "
+                    f"{DEFAULT_ADDR} unless GPUI_AGENT_ADDR is set. "
+                    "GPUI_AGENT_TOKEN is required. "
+                    "Do not file or submit a BIR return; those verbs are not tools."
+                ),
+            },
+        )
+    if method == "ping":
+        return result(msg_id, {})
+    if method == "tools/list":
+        return result(msg_id, {"tools": public_tools()})
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if not isinstance(name, str):
+            return rpc_error(msg_id, -32602, "tools/call requires a string name")
+        return result(msg_id, call_tool(name, arguments))
+    return rpc_error(msg_id, -32601, f"method not found: {method}")
+
+
+def result(msg_id: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": msg_id, "result": payload}
+
+
+def rpc_error(msg_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+
+class StdioFraming:
+    def __init__(self) -> None:
+        self.mode: str | None = None
+
+    def read(self) -> dict[str, Any] | None:
+        while True:
+            line = sys.stdin.buffer.readline()
+            if line == b"":
+                return None
+            if line.strip() == b"":
+                continue
+            if line.lower().startswith(b"content-length:"):
+                self.mode = "lsp"
+                length = int(line.split(b":", 1)[1].strip())
+                while True:
+                    header = sys.stdin.buffer.readline()
+                    if header in (b"\r\n", b"\n") or header == b"":
+                        break
+                body = sys.stdin.buffer.read(length)
+                return json.loads(body.decode("utf-8"))
+            self.mode = self.mode or "ndjson"
+            return json.loads(line.decode("utf-8"))
+
+    def write(self, message: dict[str, Any]) -> None:
+        raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if self.mode == "lsp":
+            header = f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii")
+            sys.stdout.buffer.write(header)
+            sys.stdout.buffer.write(raw)
+        else:
+            sys.stdout.buffer.write(raw + b"\n")
+        sys.stdout.buffer.flush()
+
+
+def serve() -> None:
+    framing = StdioFraming()
+    while True:
+        try:
+            message = framing.read()
+        except json.JSONDecodeError:
+            framing.write(rpc_error(None, -32700, "parse error"))
+            continue
+        if message is None:
+            return
+        if not isinstance(message, dict):
+            framing.write(rpc_error(None, -32600, "invalid request"))
+            continue
+        reply = handle(message)
+        if reply is not None:
+            framing.write(reply)
+
+
+def selftest() -> None:
+    assert encode_arg("tin", "00000000000000") == 'tin="00000000000000"'
+    assert encode_arg("confirm", True) == "confirm=true"
+    assert encode_arg("year", 2026) == "year=2026"
+    assert encode_arg("codes", ["1601C", "2551Q"]) == 'codes=["1601C","2551Q"]'
+    names = [tool["name"] for tool in TOOLS]
+    assert names.count("profile_list") == 1
+    assert "filing_submit" not in names
+    forbidden = {
+        "filing.submit",
+        "filing.queue",
+        "form.queue",
+        "form.submit",
+        "form.file",
+        "filing.file",
+        "form.submit_external",
+        "profile.ensure",
+    }
+    assert forbidden.isdisjoint({tool["invoke"] for tool in TOOLS})
+    assert tool_by_name("profile_list")["invoke"] == "profile.list"
+    assert tool_by_name("calendar_html")["invoke"] == "calendar.html"
+    save = tool_by_name("profile_save")
+    assert save is not None
+    try:
+        prepare_args(save, {"confirm": "true"})
+        raise AssertionError("string confirm must be refused")
+    except RuntimeError:
+        pass
+    assert prepare_args(save, {"confirm": True}) == {}
+    forms = tool_by_name("profile_forms_set")
+    assert forms is not None
+    forwarded = prepare_args(forms, {"year": 2026, "codes": "1601C", "confirm": True})
+    assert forwarded["confirm"] is True
+    listed = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert listed is not None
+    tool_names = [item["name"] for item in listed["result"]["tools"]]
+    assert "profile_list" in tool_names
+    assert all("." not in item["name"] for item in listed["result"]["tools"])
+    missing = call_tool("profile_list", {})
+    # token may or may not be set in the test environment; both outcomes are fine
+    # as long as a missing binary/token/daemon is a tool error rather than a crash
+    assert "content" in missing
+    note = handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert note is None
+    try:
+        assert_bir_desktop({"ok": True, "hello": {"app": "nativechat", "platform": "desktop"}})
+        raise AssertionError("nativechat must be refused")
+    except RuntimeError as exc:
+        assert "nativechat" in str(exc)
+        assert EXPECTED_APP in str(exc)
+    assert_bir_desktop(
+        {"ok": True, "hello": {"app": "bir-desktop", "platform": "headless", "protocol": 2}}
+    )
+    os.environ.pop("GPUI_AGENT_ADDR", None)
+    assert addr_from_env() == DEFAULT_ADDR
+    print("bir-mcp selftest ok", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    if os.environ.get("BIR_MCP_SELFTEST") == "1":
+        selftest()
+    else:
+        serve()

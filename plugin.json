@@ -1,0 +1,14 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "bir-mcp",
+  "version": "0.1.0",
+  "description": "Named MCP tools for eBIRforms bir-headless. Lists tax profiles with profile_list (daemon verb profile.list) on 127.0.0.1:17421. Does not file or submit returns.",
+  "author": {
+    "name": "hexuria",
+    "url": "https://github.com/hexuria"
+  },
+  "repository": "https://github.com/hexuria/bir-mcp",
+  "homepage": "https://github.com/hexuria/bir-mcp",
+  "license": "MIT",
+  "keywords": ["bir", "ebirforms", "bir-headless", "tax", "mcp"]
+}
